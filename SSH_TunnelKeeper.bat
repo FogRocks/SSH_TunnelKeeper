@@ -70,9 +70,119 @@ New-Item -ItemType Directory -Path $script:SshDir -Force | Out-Null
 # сервер принимался бы заново без проверки — риск MITM)
 Remove-Item -LiteralPath $script:LegacyKnownHosts -Force -ErrorAction SilentlyContinue
 
+# --- Оформление (цвет и стиль) ---
+# Включаем VT/ANSI в консоли. Если не удалось — цвета отключаются (fallback).
+$script:UseAnsi = $true
+try {
+    Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class ConVT { [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr GetStdHandle(int n); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetConsoleMode(IntPtr h, out uint m); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetConsoleMode(IntPtr h, uint m); }' -ErrorAction Stop
+    $h = [ConVT]::GetStdHandle(-11)
+    $m = 0
+    if ([ConVT]::GetConsoleMode($h, [ref]$m)) { [ConVT]::SetConsoleMode($h, ($m -bor 0x0004)) | Out-Null }
+} catch { $script:UseAnsi = $false }
+
+# --- Управление окном консоли: один класс P/Invoke ConWin ---
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class ConWin { [StructLayout(LayoutKind.Sequential)] public struct COORD { public short X; public short Y; } [StructLayout(LayoutKind.Sequential)] public struct SMALL_RECT { public short Left; public short Top; public short Right; public short Bottom; } [StructLayout(LayoutKind.Sequential)] public struct CONSOLE_SCREEN_BUFFER_INFO { public COORD dwSize; public COORD dwCursorPosition; public ushort wAttributes; public SMALL_RECT srWindow; public COORD dwMaximumWindowSize; } [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr GetStdHandle(int n); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetConsoleScreenBufferSize(IntPtr h, COORD size); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetConsoleWindowInfo(IntPtr h, bool absolute, ref SMALL_RECT r); [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetConsoleScreenBufferInfo(IntPtr h, out CONSOLE_SCREEN_BUFFER_INFO i); }' -ErrorAction SilentlyContinue
+
+# Размер окна при старте: 90x40 символов, высокий буфер (для динамической высоты).
+# Ресайз пользователем не блокируем. При неудаче — тихо пропускаем.
+try {
+    $hw = [ConWin]::GetStdHandle(-11)
+    $cols = 90; $rows = 40
+    $buf = New-Object ConWin+COORD
+    $buf.X = $cols; $buf.Y = 600
+    [ConWin]::SetConsoleScreenBufferSize($hw, $buf) | Out-Null
+    $rect = New-Object ConWin+SMALL_RECT
+    $rect.Left = 0; $rect.Top = 0; $rect.Right = $cols - 1; $rect.Bottom = $rows - 1
+    [ConWin]::SetConsoleWindowInfo($hw, $true, [ref]$rect) | Out-Null
+} catch { }
+
+# Динамическая высота окна: подгоняем под уже выведенный контент.
+# Не меньше базовой (40). Тихий fallback.
+function Set-WindowHeight {
+    try {
+        $h = [ConWin]::GetStdHandle(-11)
+        $info = New-Object ConWin+CONSOLE_SCREEN_BUFFER_INFO
+        if (-not [ConWin]::GetConsoleScreenBufferInfo($h, [ref]$info)) { return }
+        $curY = [int]$info.dwCursorPosition.Y
+        $cols = [int]$info.dwSize.X
+        if ($cols -lt 40) { $cols = 90 }
+        # нужная высота: под контент (курсор + запас), не меньше базовой (40)
+        $need = $curY + 3
+        if ($need -lt 40) { $need = 40 }
+        if ($need -eq [int]($info.srWindow.Bottom - $info.srWindow.Top + 1)) { return }
+        # расширяем буфер, если контент выше буфера
+        if ($need -gt [int]$info.dwSize.Y) {
+            $b = New-Object ConWin+COORD; $b.X = $cols; $b.Y = $need
+            [ConWin]::SetConsoleScreenBufferSize($h, $b) | Out-Null
+        }
+        # окно высотой $need от верха, чтобы был виден весь вывод
+        $r = New-Object ConWin+SMALL_RECT
+        $r.Left = $info.srWindow.Left; $r.Top = 0
+        $r.Right = $info.srWindow.Right; $r.Bottom = $need - 1
+        [ConWin]::SetConsoleWindowInfo($h, $true, [ref]$r) | Out-Null
+    } catch { }
+}
+
+# ANSI-хелперы (24-bit). При отсутствии поддержки возвращают пустую строку.
+function Esc([string]$c) { if ($script:UseAnsi) { return "$([char]27)[$c" } else { return '' } }
+function C([string]$color) {
+    switch ($color) {
+        'title'  { return (Esc '38;5;45m') }   # голубой
+        'accent' { return (Esc '38;5;214m') }  # янтарный
+        'ok'     { return (Esc '38;5;46m') }   # зелёный
+        'warn'   { return (Esc '38;5;220m') }  # жёлтый
+        'err'    { return (Esc '38;5;203m') }  # красный
+        'dim'    { return (Esc '38;5;244m') }  # серый
+        'bold'   { return (Esc '1m') }
+        default  { return '' }
+    }
+}
+$script:Reset = Esc '0m'
+
+# Заголовок раздела: цветная строка-полоса с названием по центру
+function Write-Header([string]$text, [string]$color) {
+    if (-not $color) { $color = 'title' }
+    $w = 51
+    $line = [string]([char]0x2550) * $w   # ═
+    $pad = [Math]::Max(0, [int](($w - $text.Length) / 2))
+    Write-Host ''
+    Write-Host ("$(C $color)$line$script:Reset")
+    Write-Host ("$(C $color)$(' ' * $pad)$text$script:Reset")
+    Write-Host ("$(C $color)$line$script:Reset")
+}
+
+# Строка со статусной меткой: [OK]/[!]/[X]/[i]
+function Write-Tag([string]$kind, [string]$text) {
+    switch ($kind) {
+        'ok'   { Write-Host ("$(C 'ok')[ OK ]$script:Reset $text") }
+        'warn' { Write-Host ("$(C 'warn')[ !! ]$script:Reset $text") }
+        'err'  { Write-Host ("$(C 'err')[ XX ]$script:Reset $text") }
+        default { Write-Host ("$(C 'dim')[ .. ]$script:Reset $text") }
+    }
+}
+
+# Обычное сообщение с цветом (обёртка над Write-Host)
+function Write-Msg([string]$text, [string]$color) {
+    if ($color) { Write-Host ("$(C $color)$text$script:Reset") } else { Write-Host $text }
+}
+
+# Пункт меню: номер в цвете, текст обычный
+function Write-MenuItem([string]$key, [string]$text) {
+    Write-Host ("  $(C 'accent')$key$script:Reset) $text")
+}
+
+# Подсказка-приглашение для ввода (цветной prompt + Read-Host)
+function Read-Prompt([string]$prompt) {
+    Set-WindowHeight
+    Write-Host ("$(C 'title')$prompt$script:Reset") -NoNewline
+    Write-Host ("$(C 'accent') > $script:Reset") -NoNewline
+    return (Read-Host)
+}
+
 # --- Вспомогательные функции ---
 
 function Pause {
+    Set-WindowHeight
     Read-Host 'Нажмите Enter, чтобы продолжить'
 }
 
@@ -103,37 +213,25 @@ function Get-ServerValue([string]$Default) {
     }
 }
 
-function Get-SshExe() {
+function Get-OpenSshExe([string]$Name) {
     $cands = @(
-        (Join-Path $env:windir 'System32\OpenSSH\ssh.exe'),
-        (Join-Path $env:ProgramFiles 'OpenSSH\bin\ssh.exe')
+        (Join-Path $env:windir 'System32\OpenSSH\' + $Name),
+        (Join-Path $env:ProgramFiles 'OpenSSH\bin\' + $Name)
     )
     if ($env:ProgramFilesx86) {
-        $cands += (Join-Path $env:ProgramFilesx86 'OpenSSH\bin\ssh.exe')
+        $cands += (Join-Path $env:ProgramFilesx86 'OpenSSH\bin\' + $Name)
     }
     foreach ($p in $cands) {
         if (Test-Path -LiteralPath $p) { return $p }
     }
-    $cmd = Get-Command ssh.exe -ErrorAction SilentlyContinue
+    $cmd = Get-Command $Name -ErrorAction SilentlyContinue
     if ($cmd -and $cmd.Source) { return $cmd.Source }
-    return 'ssh.exe'
+    return $Name
 }
 
-function Get-SshKeygenExe() {
-    $cands = @(
-        (Join-Path $env:windir 'System32\OpenSSH\ssh-keygen.exe'),
-        (Join-Path $env:ProgramFiles 'OpenSSH\bin\ssh-keygen.exe')
-    )
-    if ($env:ProgramFilesx86) {
-        $cands += (Join-Path $env:ProgramFilesx86 'OpenSSH\bin\ssh-keygen.exe')
-    }
-    foreach ($p in $cands) {
-        if (Test-Path -LiteralPath $p) { return $p }
-    }
-    $cmd = Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue
-    if ($cmd -and $cmd.Source) { return $cmd.Source }
-    return 'ssh-keygen.exe'
-}
+function Get-SshExe() { return (Get-OpenSshExe 'ssh.exe') }
+
+function Get-SshKeygenExe() { return (Get-OpenSshExe 'ssh-keygen.exe') }
 
 function Get-UserValue([string]$Default) {
     while ($true) {
@@ -204,6 +302,8 @@ function New-SshKey {
     Write-Host 'Ключ С парольной фразой безопаснее при краже профиля/диска, НО НЕ позволит автозапускать туннель до входа без ssh-agent/Pageant.'
     Write-Host 'По умолчанию создаётся КЛЮЧ БЕЗ ПАРОЛЬНОЙ ФРАЗЫ (для сохранения автозапуска).'
     $usePass = Read-Host 'Защитить ключ парольной фразой? (д/н) [по умолчанию: н]'
+    $passArg = '""'          # без парольной фразы
+    $withPass = $false
     if ($usePass -match '^(д|Д|y|Y)$') {
         $sec = Read-Host 'Парольная фраза SSH-ключа' -AsSecureString
         $passPhrase = ''
@@ -213,32 +313,23 @@ function New-SshKey {
             finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
         }
         if (-not [string]::IsNullOrEmpty($passPhrase)) {
-            Write-Host 'Генерирую ssh-ключ (ed25519, С парольной фразой)...'
-            for ($try = 1; $try -le 2; $try++) {
-                & $sshKeygen -t ed25519 -f $script:KeyPath -N $passPhrase -q -C $comment
-                if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $script:KeyPath) -and (Get-PubKeyString)) {
-                    Write-Host 'Ключ создан.'
-                    $passPhrase = $null
-                    return $true
-                }
-                Write-Host 'Не удалось создать ключ — пробую ещё раз...'
-                Remove-Item -LiteralPath $script:KeyPath, ($script:KeyPath + '.pub') -Force -ErrorAction SilentlyContinue
-            }
-            $passPhrase = $null
-            Write-Host 'Ошибка: ключ не сгенерировался.'
-            return $false
+            $passArg = $passPhrase
+            $withPass = $true
         }
     }
-    Write-Host 'Генерирую ssh-ключ (ed25519, БЕЗ парольной фразы)...'
+    if ($withPass) { Write-Host 'Генерирую ssh-ключ (ed25519, С парольной фразой)...' }
+    else           { Write-Host 'Генерирую ssh-ключ (ed25519, БЕЗ парольной фразы)...' }
     for ($try = 1; $try -le 2; $try++) {
-        & $sshKeygen -t ed25519 -f $script:KeyPath -N '""' -q -C $comment
+        & $sshKeygen -t ed25519 -f $script:KeyPath -N $passArg -q -C $comment
         if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $script:KeyPath) -and (Get-PubKeyString)) {
             Write-Host 'Ключ создан.'
+            $passArg = $null
             return $true
         }
         Write-Host 'Не удалось создать ключ — пробую ещё раз...'
         Remove-Item -LiteralPath $script:KeyPath, ($script:KeyPath + '.pub') -Force -ErrorAction SilentlyContinue
     }
+    $passArg = $null
     Write-Host 'Ошибка: ключ не сгенерировался.'
     return $false
 }
@@ -284,20 +375,67 @@ function Test-SshConnection([string]$User, [string]$Server, [string]$Port, [stri
     return ($LASTEXITCODE -eq 0)
 }
 
-# Показывает открытый ключ и ждёт клавишу; Esc = отмена (возврат $false).
-function Show-PubKeyAndWait {
+# Показывает открытый ключ в рамке (для вставки в authorized_keys на сервере).
+# Ширина рамки — по окну; длинный ключ и путь переносятся по строкам.
+# -Cancelable: Esc = отмена (возвращает $false), иначе Enter.
+function Show-PubKeyBox {
+    param([switch]$Cancelable)
     Write-Host ''
-    Write-Host ('Путь к ключу: {0}' -f $script:KeyPath)
-    Write-Host 'Открытый ключ — добавьте эту строку на сервер в ~/.ssh/authorized_keys:'
-    Write-Host '------------------------- КЛЮЧ -------------------------'
     $pub = Get-PubKeyString
-    if ($pub) { Write-Host $pub } else { Write-Host 'Не удалось прочитать ключ.' }
-    Write-Host '--------------------------------------------------------'
+    $t = C 'title'; $a = C 'accent'; $d = C 'dim'; $r = $script:Reset
+    $v = [char]0x2551
+    $tl = [char]0x2554; $tr = [char]0x2557; $bl = [char]0x255A; $br = [char]0x255D
+    if (-not $pub) {
+        Write-Tag 'warn' 'SSH-ключ не найден — сгенерируйте его (пункт 4 «Изменить» -> ssh-ключ).'
+        return $true
+    }
+    # ширина окна (в символах) с запасом; ограничиваем разумным максимумом
+    $winW = 90
+    try { $w = $Host.UI.RawUI.WindowSize.Width; if ($w -ge 40) { $winW = [int]$w } } catch { }
+    $inner = $winW - 3 - 2 - 2            # отступ 3 + рамка 2 + поля 2
+    if ($inner -lt 30) { $inner = 30 }
+    if ($inner -gt 110) { $inner = 110 }
+    $wrapW = $inner - 2                   # полезная ширина текста (с левым полем 2)
+    # перенос текста по словам (при необходимости — по символам)
+    function Split-Wrap([string]$s, [int]$w) {
+        $out = @()
+        while ($s.Length -gt $w) {
+            $cut = $s.LastIndexOf(' ', [Math]::Min($w, $s.Length - 1))
+            if ($cut -le 0) { $cut = $w }
+            $out += $s.Substring(0, $cut)
+            $s = $s.Substring($cut).TrimStart(' ')
+        }
+        $out += $s
+        return ,$out
+    }
+    $items = @()   # элементы: @{ text=...; color=... }
+    foreach ($l in (Split-Wrap ('Путь: {0}' -f $script:KeyPath) $wrapW)) { $items += ,@{ text = $l; color = $d } }
+    $items += ,@{ text = ''; color = $t }
+    foreach ($l in (Split-Wrap 'Добавьте ключ на сервер в ~/.ssh/authorized_keys:' $wrapW)) { $items += ,@{ text = $l; color = $t } }
+    $items += ,@{ text = ''; color = $t }
+    foreach ($l in (Split-Wrap $pub $wrapW)) { $items += ,@{ text = $l; color = $a } }
+
+    $h = [string]([char]0x2550) * $inner
+    $ind = '   '
+    Write-Host ("$ind$t$tl$h$tr$r")
+    foreach ($it in $items) {
+        $txt = $it.text
+        $right = $inner - 2 - $txt.Length
+        if ($right -lt 0) { $right = 0 }
+        Write-Host ("$ind$t$v$r  $($it.color)$txt$r$(' ' * $right)$t$v$r")
+    }
+    Write-Host ("$ind$t$bl$h$br$r")
     Write-Host ''
-    Write-Host 'Добавили ключ на сервер? Нажмите любую клавишу (Esc — отмена)...'
-    $key = [Console]::ReadKey($true)
+    if ($Cancelable) {
+        Write-Host 'Добавили ключ на сервер? Нажмите любую клавишу (Esc — отмена)...'
+        $key = $null
+        try { $key = [Console]::ReadKey($true) } catch { $null = Read-Host }
+        Write-Host ''
+        if ($key -and $key.Key -eq [ConsoleKey]::Esc) { return $false }
+        return $true
+    }
+    try { $null = [Console]::ReadKey($true) } catch { $null = Read-Host }
     Write-Host ''
-    if ($key.Key -eq [ConsoleKey]::Esc) { return $false }
     return $true
 }
 
@@ -311,7 +449,7 @@ function Ensure-Connection {
     if (-not (Test-Path -LiteralPath $script:KeyPath)) {
         Write-Host ('SSH-ключ не найден ({0}). Генерирую новый...' -f $script:KeyPath)
         if (-not (New-SshKey)) { return $false }
-        if (-not (Show-PubKeyAndWait)) { Write-Host 'Отменено.'; return $false }
+        if (-not (Show-PubKeyBox -Cancelable)) { Write-Host 'Отменено.'; return $false }
         if (Test-SshConnection $script:Config.user $script:Config.server $script:Config.ssh_port $script:KeyPath) {
             Write-Host 'Соединение по ключу подтверждено. Продолжаем...'
         } else {
@@ -329,7 +467,7 @@ function Ensure-Connection {
         }
         Write-Host 'Ключ не принят сервером — показываю его, чтобы вы его добавили.'
         Write-Host ('Если сервер менял свой ключ — удалите файл {0} и повторите установку.' -f $script:KnownHosts)
-        if (-not (Show-PubKeyAndWait)) { Write-Host 'Отменено.'; return $false }
+        if (-not (Show-PubKeyBox -Cancelable)) { Write-Host 'Отменено.'; return $false }
     }
 }
 
@@ -494,7 +632,7 @@ function Remove-CreatedFiles([bool]$includeKey) {
 # --- меню: Установить ---
 function Invoke-Setup([hashtable]$defaults) {
     Write-Host ''
-    Write-Host '---------------- НАСТРОЙКА ТУННЕЛЯ ----------------'
+    Write-Header 'НАСТРОЙКА ТУННЕЛЯ'
     $script:Config = @{
         server   = Get-ServerValue $defaults['server']
         user     = Get-UserValue   $defaults['user']
@@ -537,18 +675,20 @@ function Invoke-Setup([hashtable]$defaults) {
 
     Save-Cfg
     try { Register-SshTask } catch {
-        Write-Host 'Не удалось создать задачу в планировщике:'
-        Write-Host $_.Exception.Message
+        Write-Tag 'err' 'Не удалось создать задачу в планировщике:'
+        Write-Msg $_.Exception.Message 'err'
         Pause
         return
     }
-    Write-Host ('Задача "{0}" установлена.' -f $script:TaskName)
-    $start = Read-Host 'Запустить туннель сейчас? (д/н)'
+    Write-Tag 'ok' ('Задача "{0}" установлена.' -f $script:TaskName)
+    Write-Host ("$(C 'title')Запустить туннель сейчас? (д/н)$script:Reset") -NoNewline
+    Write-Host ("$(C 'accent') > $script:Reset") -NoNewline
+    $start = Read-Host
     if ($start -match '^(д|y)') {
-        try { Start-TunnelTask | Out-Null; Write-Host 'Туннель запущен.' }
-        catch { Write-Host ('Ошибка запуска: {0}' -f $_.Exception.Message) }
+        try { Start-TunnelTask | Out-Null; Write-Tag 'ok' 'Туннель запущен.' }
+        catch { Write-Tag 'err' ('Ошибка запуска: {0}' -f $_.Exception.Message) }
     } else {
-        Write-Host 'Туннель запустится автоматически (по расписанию планировщика).'
+        Write-Msg 'Туннель запустится автоматически (по расписанию планировщика).' 'dim'
     }
     Pause
 }
@@ -556,80 +696,94 @@ function Invoke-Setup([hashtable]$defaults) {
 # --- меню: Удалить ---
 function Invoke-Uninstall {
     Write-Host ''
-    Write-Host '============== УДАЛЕНИЕ =============='
-    Write-Host '  1 - Только задача в планировщике (ключ и файлы останутся)'
-    Write-Host '  2 - Задача + настройки, лог и копия скрипта (ssh-ключ останется)'
-    Write-Host '  3 - Полностью: задача + настройки + лог + ssh-ключ'
-    Write-Host '  0 - Отмена'
-    $ans = Read-Host 'Ваш выбор (1/2/3/0)'
+    Write-Header 'УДАЛЕНИЕ'
+    Write-MenuItem '1' 'Только задача в планировщике (ключ и файлы останутся)'
+    Write-MenuItem '2' 'Задача + настройки, лог и копия скрипта (ssh-ключ останется)'
+    Write-MenuItem '3' 'Полностью: задача + настройки + лог + ssh-ключ'
+    Write-MenuItem '0' 'Отмена'
+    Write-Host ("$(C 'title')Ваш выбор (1/2/3/0)$script:Reset") -NoNewline
+    Write-Host ("$(C 'accent') > $script:Reset") -NoNewline
+    $ans = Read-Host
     switch ($ans) {
-        '1' { Unregister-SshTask; Write-Host 'Конфигурация и ssh-ключ не тронуты.' }
+        '1' { Unregister-SshTask; Write-Tag 'ok' 'Конфигурация и ssh-ключ не тронуты.' }
         '2' { Unregister-SshTask; Remove-CreatedFiles $false }
         '3' { Unregister-SshTask; Remove-CreatedFiles $true }
-        default { Write-Host 'Отмена.' }
+        default { Write-Msg 'Отмена.' 'dim' }
     }
     Pause
 }
 
 # --- меню: Статус ---
 function Show-Status {
-    Write-Host ''
-    Write-Host '================ СТАТУС ================'
+    Write-Header 'СТАТУС'
     $task = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
     if ($task) {
         $cfg = Read-Cfg
-        Write-Host ('Задача в планировщике: ДА  (состояние: {0})' -f $task.State)
+        Write-Msg ('Задача в планировщике: ДА  (состояние: {0})' -f $task.State) 'title'
         $info = Get-ScheduledTaskInfo -TaskName $script:TaskName -ErrorAction SilentlyContinue
         if ($info) {
-            Write-Host ('Последний запуск: {0}  |  Результат: {1}' -f $info.LastRunTime, $info.LastTaskResult)
+            Write-Msg ('Последний запуск: {0}  |  Результат: {1}' -f $info.LastRunTime, $info.LastTaskResult) 'dim'
         }
-        if ($task.State -eq 'Running') { Write-Host 'Туннель сейчас: РАБОТАЕТ' }
-        else                           { Write-Host 'Туннель сейчас: не работает' }
+        if ($task.State -eq 'Running') { Write-Tag 'ok' 'Туннель сейчас: РАБОТАЕТ' }
+        else                           { Write-Tag 'warn' 'Туннель сейчас: не работает' }
 
         if ($cfg['server']) {
-            Write-Host '--- Параметры соединения ---'
-            Write-Host ('Сервер:           {0}' -f $cfg['server'])
-            Write-Host ('Пользователь ssh: {0}' -f $cfg['user'])
-            Write-Host ('SSH-порт:         {0}' -f $cfg['ssh_port'])
+            Write-Msg '--- Параметры соединения ---' 'dim'
+            Write-Msg ('  Сервер:           {0}' -f $cfg['server'])
+            Write-Msg ('  Пользователь ssh: {0}' -f $cfg['user'])
+            Write-Msg ('  SSH-порт:         {0}' -f $cfg['ssh_port'])
             $pairs = @(ConvertTo-PortPairs $cfg['ports'])
             if ($pairs.Count -gt 0) {
-                Write-Host 'Пробросы:'
+                Write-Msg '  Пробросы:'
                 Show-PortPairs $pairs
             } else {
-                Write-Host 'Пробросы не заданы.'
+                Write-Msg '  Пробросы не заданы.' 'dim'
             }
         } else {
-            Write-Host 'Параметры соединения не найдены (нет файла настроек).'
+            Write-Tag 'warn' 'Параметры соединения не найдены (нет файла настроек).'
         }
     } else {
-        Write-Host ('Задачи "{0}" в планировщике НЕТ. Установите через пункт 1.' -f $script:TaskName)
+        Write-Tag 'warn' ('Задачи "{0}" в планировщике НЕТ. Установите через пункт 1.' -f $script:TaskName)
     }
 
     $keyOk = Test-Path -LiteralPath $script:KeyPath
-    Write-Host ('SSH-ключ: {0}' -f $(if ($keyOk) { 'есть (' + $script:KeyPath + ')' } else { 'ОТСУТСТВУЕТ' }))
+    if ($keyOk) { Write-Tag 'ok' ('SSH-ключ: есть ({0})' -f $script:KeyPath) }
+    else        { Write-Tag 'warn' 'SSH-ключ: ОТСУТСТВУЕТ' }
     $sshProc = @(Get-Process ssh -ErrorAction SilentlyContinue)
-    Write-Host ('Процессы ssh.exe: {0}' -f $sshProc.Count)
+    Write-Msg ('Процессы ssh.exe: {0}' -f $sshProc.Count) 'dim'
+
+    if ($keyOk) {
+        Write-Host ''
+        Write-Host ("$(C 'accent')[ К ]$script:Reset Посмотреть ssh-ключ (для вставки на сервер)") -NoNewline
+        Write-Host ("   $(C 'dim')(Enter — далее, K — показать ключ)$script:Reset")
+        Write-Host ("$(C 'title')Действие$script:Reset") -NoNewline
+        Write-Host ("$(C 'accent') > $script:Reset") -NoNewline
+        $act = Read-Host
+        if ($act -match '^(k|к|9)$') { Show-PubKeyBox }
+    }
 
     if (Test-Path -LiteralPath $script:LogPath) {
         Write-Host ''
-        Write-Host 'Последние строки лога:'
-        Get-Content -LiteralPath $script:LogPath -Tail 6 | ForEach-Object { Write-Host "  $_" }
+        Write-Msg 'Последние строки лога:' 'dim'
+        Get-Content -LiteralPath $script:LogPath -Tail 6 | ForEach-Object { Write-Host ("  $(C 'dim')$_$script:Reset") }
     }
 
     if ($task -and $task.State -ne 'Running') {
         Write-Host ''
-        $restart = Read-Host 'Туннель сейчас не работает. Перезапустить? (д/н)'
+        Write-Host ("$(C 'title')Туннель сейчас не работает. Перезапустить? (д/н)$script:Reset") -NoNewline
+        Write-Host ("$(C 'accent') > $script:Reset") -NoNewline
+        $restart = Read-Host
         if ($restart -match '^(д|y)') {
             try {
                 Start-TunnelTask | Out-Null
-                Write-Host 'Туннель запущен.'
+                Write-Tag 'ok' 'Туннель запущен.'
             } catch {
-                Write-Host ('Ошибка запуска: {0}' -f $_.Exception.Message)
+                Write-Tag 'err' ('Ошибка запуска: {0}' -f $_.Exception.Message)
             }
         }
     } elseif ($task -and $task.State -eq 'Running') {
         Write-Host ''
-        Write-Host 'Всё работает — задача выполняется.'
+        Write-Tag 'ok' 'Всё работает — задача выполняется.'
     }
     Pause
 }
@@ -641,8 +795,8 @@ function Stop-Tunnel {
     Disable-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
     Stop-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
     Stop-OwnSshProcesses
-    Write-Host 'Туннель остановлен: задача остановлена и отключена, ssh-процессы туннеля завершены.'
-    Write-Host 'Включить снова: пункт 3 «Статус» -> перезапуск, или пункт 1 «Установить».'
+    Write-Tag 'ok' 'Туннель остановлен: задача остановлена и отключена, ssh-процессы туннеля завершены.'
+    Write-Msg 'Включить снова: пункт 3 «Статус» -> перезапуск, или пункт 1 «Установить».' 'dim'
     Pause
 }
 
@@ -746,17 +900,17 @@ function Invoke-Change {
     }
 
     while ($true) {
+        Clear-Host
+        Write-Header 'ЧТО ИЗМЕНИТЬ'
+        Write-MenuItem '1' 'Добавить проброс'
+        Write-MenuItem '2' 'Удалить проброс'
+        Write-MenuItem '3' 'Изменить проброс'
+        Write-MenuItem '4' 'Сервер / пользователь / ssh-порт'
+        Write-MenuItem '5' 'Показать ssh-ключ'
+        Write-MenuItem '6' 'Создать новый ssh-ключ'
+        Write-MenuItem '7' 'Назад (в главное меню)'
         Write-Host ''
-        Write-Host '--------------- ЧТО ИЗМЕНИТЬ? ---------------'
-        Write-Host '  1) Добавить проброс'
-        Write-Host '  2) Удалить проброс'
-        Write-Host '  3) Изменить проброс'
-        Write-Host '  4) Сервер / пользователь / ssh-порт'
-        Write-Host '  5) Показать ssh-ключ'
-        Write-Host '  6) Создать новый ssh-ключ'
-        Write-Host '  7) Назад (в главное меню)'
-        Write-Host '---------------------------------------------'
-        $what = Read-Host 'Выберите пункт'
+        $what = Read-Prompt 'Выберите пункт'
         $cfg = Read-Cfg
 
         switch ($what) {
@@ -785,7 +939,7 @@ function Invoke-Change {
                 }
             }
             '5' {
-                Show-PubKeyAndWait
+                Show-PubKeyBox
             }
             '6' {
                 Remove-Item -LiteralPath $script:KeyPath, ($script:KeyPath + '.pub') -Force -ErrorAction SilentlyContinue
@@ -823,8 +977,7 @@ function Resolve-Selection {
 }
 
 function Stop-AllSshTunnels {
-    Write-Host ''
-    Write-Host '========== ЗАВЕРШЕНИЕ ВСЕХ SSH-ТУННЕЛЕЙ =========='
+    Write-Header 'ЗАВЕРШЕНИЕ ВСЕХ SSH-ТУННЕЛЕЙ' 'err'
 
     $procs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
     $byId = @{}
@@ -944,19 +1097,18 @@ function Stop-AllSshTunnels {
 function Show-Menu {
     while ($true) {
         Clear-Host
-        Write-Host '============================================='
-        Write-Host '      SSH TunnelKeeper'
-        Write-Host '   обратный SSH-туннель (проброс портов)'
-        Write-Host '============================================='
-        Write-Host '  1) Установить'
-        Write-Host '  2) Удалить'
-        Write-Host '  3) Статус'
-        Write-Host '  4) Изменить'
-        Write-Host '  5) Остановить туннель'
-        Write-Host '  6) Завершить все ssh-туннели'
-        Write-Host '  7) Выход'
-        Write-Host '============================================='
-        $choice = Read-Host 'Выберите пункт меню'
+        Show-Banner
+        Write-Host ''
+        Write-MenuItem '1' 'Установить'
+        Write-MenuItem '2' 'Удалить'
+        Write-MenuItem '3' 'Статус'
+        Write-MenuItem '4' 'Изменить'
+        Write-MenuItem '5' 'Остановить туннель'
+        Write-MenuItem '6' 'Завершить все ssh-туннели'
+        Write-MenuItem '7' 'Выход'
+        Write-Host ''
+        Write-Host ("$(C 'dim')$([string]([char]0x2500) * 55)$script:Reset")
+        $choice = Read-Prompt 'Выберите пункт меню'
 
         switch ($choice) {
             '1' { Clear-Host; try { $cfg = Read-Cfg; if (-not $cfg['server']) { $cfg = @{} }; Invoke-Setup $cfg } catch { Show-Error $_ } }
@@ -965,16 +1117,74 @@ function Show-Menu {
             '4' { Clear-Host; try { Invoke-Change } catch { Show-Error $_ } }
             '5' { Clear-Host; try { Stop-Tunnel } catch { Show-Error $_ } }
             '6' { Clear-Host; try { Stop-AllSshTunnels } catch { Show-Error $_ } }
-            '7' { Write-Host 'До свидания!'; exit }
-            default { Write-Host 'Неверный пункт меню, попробуйте ещё раз.'; Pause }
+            '7' { Write-Host ("$(C 'title')До свидания!$script:Reset"); exit }
+            default { Write-Tag 'err' 'Неверный пункт меню, попробуйте ещё раз.'; Pause }
         }
     }
 }
 
+# ASCII-логотип в шапке. Все строки логотипа одной ширины (ровный блок);
+# ширина рамки = ширина логотипа + поля по бокам.
+function Show-Banner {
+    $t = C 'title'
+    $a = C 'accent'
+    $r = $script:Reset
+    $d = C 'dim'
+    $v = [char]0x2551
+
+    # логотип "SSH / TUNNEL / KEEPER" (figlet standard, 42 символа в ширину)
+    $logo = @(
+        ' ____   ____   _   _                      '
+        '/ ___| / ___| | | | |                     '
+        '\___ \ \___ \ | |_| |                     '
+        ' ___) | ___) ||  _  |                     '
+        '|____/ |____/ |_| |_|                     '
+        '                                          '
+        ' _____  _   _  _   _  _   _  _____  _     '
+        '|_   _|| | | || \ | || \ | || ____|| |    '
+        '  | |  | |_| ||  \| ||  \| ||  _|  | |    '
+        '  | |  |  _  || |\  || |\  || |___ | |___ '
+        '  |_|  |_| |_||_| |_||_| |_||_____||_____|'
+        ' _  __ _____  _____  ____   _____  ____   '
+        '| |/ /| ____|| ____||  _ \ | ____||  _ \  '
+        '| '' / |  _|  |  _|  | |_) ||  _|  | |_) | '
+        '| . \ | |___ | |___ |  __/ | |___ |  _ <  '
+        '|_|\_\|_____||_____||_|    |_____||_| \_\ '
+    )
+    $logoW = ($logo | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum
+    $side  = 3
+    $inner = $logoW + ($side * 2)
+    $h  = [string]([char]0x2550) * $inner
+    $tl = [char]0x2554; $tr = [char]0x2557; $bl = [char]0x255A; $br = [char]0x255D
+    $ind = '   '
+
+    Write-Host ("$ind$d$tl$h$tr$r")
+    for ($i = 0; $i -lt $logo.Count; $i++) {
+        $txt = $logo[$i]
+        # строки "KEEPER" (индексы 11-15) — янтарные, остальные голубые
+        if ($i -ge 11) { $col = $a } else { $col = $t }
+        $right = $inner - $side - $txt.Length
+        if ($right -lt 0) { $right = 0 }
+        Write-Host ("$ind$d$v$r$(' ' * $side)$col$txt$r$(' ' * $right)$d$v$r")
+    }
+    # подпись по центру
+    $sub = 'обратный SSH-туннель'
+    $leftSub = [int][Math]::Floor(($inner - $sub.Length) / 2)
+    $rightSub = $inner - $leftSub - $sub.Length
+    Write-Host ("$ind$d$v$r$(' ' * $leftSub)$d$sub$r$(' ' * $rightSub)$d$v$r")
+    # автор
+    $tag = 'by FogRock'
+    $leftTag = [int][Math]::Floor(($inner - $tag.Length) / 2)
+    $rightTag = $inner - $leftTag - $tag.Length
+    Write-Host ("$ind$d$v$r$(' ' * $leftTag)$a$tag$r$(' ' * $rightTag)$d$v$r")
+    Write-Host ("$ind$d$bl$h$br$r")
+}
+
+
 function Show-Error {
     param($err)
     Write-Host ''
-    Write-Host "Произошла ошибка: $($err.Exception.Message)"
+    Write-Tag 'err' "Произошла ошибка: $($err.Exception.Message)"
     Pause
 }
 
