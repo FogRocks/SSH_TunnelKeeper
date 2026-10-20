@@ -20,10 +20,11 @@ __FINAL_TUNNEL_PS_START__
 #  Техническое описание: specification.md (в комплекте).
 #
 #  Файлы (в %USERPROFILE%\.ssh):
-#    ssh_tunnelkeeper_config.txt   настройки (скрытый файл)
-#    ssh_tunnelkeeper.log          лог работы туннеля
-#    id_ed25519 / id_ed25519.pub   ssh-ключ
-#    SSH_TunnelKeeper.bat          копия самого скрипта
+#    ssh_tunnelkeeper_config.txt          настройки (скрытый файл)
+#    ssh_tunnelkeeper.log                 лог работы туннеля (при >1 МБ откатывается в .old)
+#    ssh_tunnelkeeper_known_hosts         known_hosts (постоянный, для TOFU)
+#    id_ed25519 / id_ed25519.pub          ssh-ключ (комментарий нейтральный: ssh-tunnelkeeper)
+#    SSH_TunnelKeeper.bat                 копия самого скрипта
 #  Задача планировщика: SSH_TunnelKeeper
 #
 #  На сервере в sshd_config должны быть: AllowTcpForwarding yes,
@@ -37,15 +38,17 @@ try { [ConCP]::SetConsoleOutputCP(65001) | Out-Null; [ConCP]::SetConsoleCP(65001
 [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
 
 # --- Пути и константы ---
-$script:SshDir     = Join-Path $env:USERPROFILE '.ssh'
-$script:KeyPath    = Join-Path $script:SshDir 'id_ed25519'
-$script:ConfigPath = Join-Path $script:SshDir 'ssh_tunnelkeeper_config.txt'
-$script:LogPath    = Join-Path $script:SshDir 'ssh_tunnelkeeper.log'
-$script:KnownHosts = Join-Path $env:TEMP 'ssh_tunnelkeeper_known_hosts'
-$script:TaskName   = 'SSH_TunnelKeeper'
-$script:TaskDesc   = 'SSH_TunnelKeeper: обратный SSH-туннель (проброс портов)'
-$script:LiveName   = 'SSH_TunnelKeeper.bat'
-$script:LivePath   = Join-Path $script:SshDir $script:LiveName
+$script:SshDir         = Join-Path $env:USERPROFILE '.ssh'
+$script:KeyPath        = Join-Path $script:SshDir 'id_ed25519'
+$script:ConfigPath     = Join-Path $script:SshDir 'ssh_tunnelkeeper_config.txt'
+$script:LogPath        = Join-Path $script:SshDir 'ssh_tunnelkeeper.log'
+$script:KnownHosts     = Join-Path $script:SshDir 'ssh_tunnelkeeper_known_hosts'
+$script:LegacyKnownHosts = Join-Path $env:TEMP 'ssh_tunnelkeeper_known_hosts'
+$script:KeyComment     = 'ssh-tunnelkeeper'
+$script:TaskName       = 'SSH_TunnelKeeper'
+$script:TaskDesc       = 'SSH_TunnelKeeper: обратный SSH-туннель (проброс портов)'
+$script:LiveName       = 'SSH_TunnelKeeper.bat'
+$script:LivePath       = Join-Path $script:SshDir $script:LiveName
 
 # --- путь к самому файлу (задаётся bat-заголовком) ---
 $script:SelfPath = $env:FINAL_TUNNEL_SELF
@@ -62,6 +65,10 @@ if (-not $script:IsAdmin) {
 }
 
 New-Item -ItemType Directory -Path $script:SshDir -Force | Out-Null
+
+# миграция: убираем старый known_hosts из %TEMP% (после очистки temp
+# сервер принимался бы заново без проверки — риск MITM)
+Remove-Item -LiteralPath $script:LegacyKnownHosts -Force -ErrorAction SilentlyContinue
 
 # --- Вспомогательные функции ---
 
@@ -80,8 +87,8 @@ function Get-PortValue([string]$Label, [string]$Default) {
     while ($true) {
         $v = Get-PromptValue $Label $Default
         if ($v -match '^\d+$') {
-            $n = [int]$v
-            if ($n -ge 1 -and $n -le 65535) { return $n }
+            $n = [long]$v
+            if ($n -ge 1 -and $n -le 65535) { return [int]$n }
         }
         Write-Host 'Порт должен быть целым числом от 1 до 65535. Попробуйте ещё раз.'
     }
@@ -93,6 +100,47 @@ function Get-ServerValue([string]$Default) {
         if ([string]::IsNullOrWhiteSpace($s)) { return $s }
         if ($s -match '^[0-9A-Za-z.\-_]+$') { return $s }
         Write-Host "Предупреждение: в адресе '$s' есть недопустимые символы (например запятая вместо точки). Проверьте ввод."
+    }
+}
+
+function Get-SshExe() {
+    $cands = @(
+        (Join-Path $env:windir 'System32\OpenSSH\ssh.exe'),
+        (Join-Path $env:ProgramFiles 'OpenSSH\bin\ssh.exe')
+    )
+    if ($env:ProgramFilesx86) {
+        $cands += (Join-Path $env:ProgramFilesx86 'OpenSSH\bin\ssh.exe')
+    }
+    foreach ($p in $cands) {
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+    $cmd = Get-Command ssh.exe -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) { return $cmd.Source }
+    return 'ssh.exe'
+}
+
+function Get-SshKeygenExe() {
+    $cands = @(
+        (Join-Path $env:windir 'System32\OpenSSH\ssh-keygen.exe'),
+        (Join-Path $env:ProgramFiles 'OpenSSH\bin\ssh-keygen.exe')
+    )
+    if ($env:ProgramFilesx86) {
+        $cands += (Join-Path $env:ProgramFilesx86 'OpenSSH\bin\ssh-keygen.exe')
+    }
+    foreach ($p in $cands) {
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+    $cmd = Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) { return $cmd.Source }
+    return 'ssh-keygen.exe'
+}
+
+function Get-UserValue([string]$Default) {
+    while ($true) {
+        $s = Get-PromptValue 'Пользователь SSH' $Default
+        if ([string]::IsNullOrWhiteSpace($s)) { return $s }
+        if ($s -match '^[0-9A-Za-z._\\][0-9A-Za-z._\\-]*$') { return $s }
+        Write-Host "Предупреждение: в логине '$s' недопустимые символы. Допустимы буквы, цифры, точка, _ , - и обратный слэш (домен: DOMAIN\user). Без пробелов, кавычек и @. Проверьте ввод."
     }
 }
 
@@ -145,12 +193,45 @@ function Save-Cfg {
     [IO.File]::SetAttributes($script:ConfigPath, [IO.FileAttributes]::Hidden)
 }
 
-# --- ssh-ключ (ed25519, без пароля); публичный ключ читаем из приватного ---
+# --- ssh-ключ (ed25519); публичный ключ: .pub (приоритет) или ssh-keygen -y ---
 function New-SshKey {
-    Write-Host 'Генерирую ssh-ключ (ed25519, без пароля)...'
-    $comment = $env:USERNAME + '@' + $env:COMPUTERNAME
+    $sshKeygen = Get-SshKeygenExe
+    $comment = $script:KeyComment
+    Write-Host ''
+    Write-Host 'Создание SSH-ключа (ed25519)'
+    Write-Host '--- ВНИМАНИЕ ПО БЕЗОПАСНОСТИ ---'
+    Write-Host 'Ключ БЕЗ парольной фразы позволяет автозапускать туннель ДО входа в Windows.'
+    Write-Host 'Ключ С парольной фразой безопаснее при краже профиля/диска, НО НЕ позволит автозапускать туннель до входа без ssh-agent/Pageant.'
+    Write-Host 'По умолчанию создаётся КЛЮЧ БЕЗ ПАРОЛЬНОЙ ФРАЗЫ (для сохранения автозапуска).'
+    $usePass = Read-Host 'Защитить ключ парольной фразой? (д/н) [по умолчанию: н]'
+    if ($usePass -match '^(д|Д|y|Y)$') {
+        $sec = Read-Host 'Парольная фраза SSH-ключа' -AsSecureString
+        $passPhrase = ''
+        if ($sec -and $sec.Length -gt 0) {
+            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+            try { $passPhrase = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr) }
+            finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+        }
+        if (-not [string]::IsNullOrEmpty($passPhrase)) {
+            Write-Host 'Генерирую ssh-ключ (ed25519, С парольной фразой)...'
+            for ($try = 1; $try -le 2; $try++) {
+                & $sshKeygen -t ed25519 -f $script:KeyPath -N $passPhrase -q -C $comment
+                if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $script:KeyPath) -and (Get-PubKeyString)) {
+                    Write-Host 'Ключ создан.'
+                    $passPhrase = $null
+                    return $true
+                }
+                Write-Host 'Не удалось создать ключ — пробую ещё раз...'
+                Remove-Item -LiteralPath $script:KeyPath, ($script:KeyPath + '.pub') -Force -ErrorAction SilentlyContinue
+            }
+            $passPhrase = $null
+            Write-Host 'Ошибка: ключ не сгенерировался.'
+            return $false
+        }
+    }
+    Write-Host 'Генерирую ssh-ключ (ed25519, БЕЗ парольной фразы)...'
     for ($try = 1; $try -le 2; $try++) {
-        & ssh-keygen -t ed25519 -f $script:KeyPath -N '""' -q -C $comment
+        & $sshKeygen -t ed25519 -f $script:KeyPath -N '""' -q -C $comment
         if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $script:KeyPath) -and (Get-PubKeyString)) {
             Write-Host 'Ключ создан.'
             return $true
@@ -164,25 +245,46 @@ function New-SshKey {
 
 function Get-PubKeyString {
     if (-not (Test-Path -LiteralPath $script:KeyPath)) { return $null }
-    $pub = & ssh-keygen -y -f $script:KeyPath 2>$null
+    $pubFile = $script:KeyPath + '.pub'
+    if (Test-Path -LiteralPath $pubFile) {
+        $line = Get-Content -LiteralPath $pubFile -TotalCount 1 -ErrorAction SilentlyContinue
+        if ($line) { return $line.Trim() }
+    }
+    $sshKeygen = Get-SshKeygenExe
+    $pub = & $sshKeygen -y -f $script:KeyPath 2>$null
     if ($LASTEXITCODE -ne 0 -or -not $pub) { return $null }
     $parts = $pub -split ' '
     if ($parts.Count -ge 2) {
         $keyPart = $parts[0..($parts.Count - 2)] -join ' '
-        return $keyPart + ' ' + ($env:USERNAME + '@' + $env:COMPUTERNAME)
+        return $keyPart + ' ' + $script:KeyComment
     }
     return $pub
 }
 
+# --- поддержка StrictHostKeyChecking=accept-new (OpenSSH >= 7.6) ---
+# accept-new: новые ключи принимаются автоматически, при смене ключа сервера — отклоняет (защита от MITM).
+# Детект через ssh -G. Fallback 'no': на старых ssh (<7.6) 'yes' сделал бы
+# невозможным первое подключение (BatchMode, нет TTY для подтверждения).
+function Get-HostKeyCheckingOption {
+    $sshExe = Get-SshExe
+    try {
+        & $sshExe -G -o 'StrictHostKeyChecking=accept-new' -o 'BatchMode=yes' localhost 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { return 'accept-new' }
+    } catch { }
+    return 'no'
+}
+
 # --- проверка соединения по ключу (без запроса пароля) ---
 function Test-SshConnection([string]$User, [string]$Server, [string]$Port, [string]$Key) {
-    & ssh -i $Key -p $Port -o 'BatchMode=yes' -o 'ConnectTimeout=8' `
-         -o 'StrictHostKeyChecking=no' -o "UserKnownHostsFile=$($script:KnownHosts)" `
+    $hk = Get-HostKeyCheckingOption
+    $sshExe = Get-SshExe
+    & $sshExe -i $Key -p $Port -o 'BatchMode=yes' -o 'ConnectTimeout=8' `
+         -o "StrictHostKeyChecking=$hk" -o "UserKnownHostsFile=$script:KnownHosts" `
          "$User@$Server" 'exit 0' 2>$null | Out-Null
     return ($LASTEXITCODE -eq 0)
 }
 
-# Показывает открытый ключ и ждёт ЛЮБУЮ клавишу (без отмены).
+# Показывает открытый ключ и ждёт клавишу; Esc = отмена (возврат $false).
 function Show-PubKeyAndWait {
     Write-Host ''
     Write-Host ('Путь к ключу: {0}' -f $script:KeyPath)
@@ -192,21 +294,24 @@ function Show-PubKeyAndWait {
     if ($pub) { Write-Host $pub } else { Write-Host 'Не удалось прочитать ключ.' }
     Write-Host '--------------------------------------------------------'
     Write-Host ''
-    Write-Host 'Добавили ключ на сервер? Нажмите ЛЮБУЮ клавишу...'
-    $null = [Console]::ReadKey($true)
+    Write-Host 'Добавили ключ на сервер? Нажмите любую клавишу (Esc — отмена)...'
+    $key = [Console]::ReadKey($true)
     Write-Host ''
+    if ($key.Key -eq [ConsoleKey]::Esc) { return $false }
+    return $true
 }
 
 # Порядок работы с ключом:
-#  1) ключа НЕТ  -> создаём новый, показываем ключ и ждём клавишу;
+#  1) ключа НЕТ  -> создаём новый, показываем ключ и ждём клавишу (Esc — отмена);
 #  2) ключ ЕСТЬ  -> пробуем подключиться в фоновом режиме (без пароля);
 #                   успех  -> продолжаем работу;
-#                   неудача -> показываем ключ и ждём клавишу, затем пытаемся снова.
+#                   неудача -> показываем ключ и ждём клавишу, затем пытаемся снова
+#                   (Esc на любом показе — отмена установки).
 function Ensure-Connection {
     if (-not (Test-Path -LiteralPath $script:KeyPath)) {
         Write-Host ('SSH-ключ не найден ({0}). Генерирую новый...' -f $script:KeyPath)
         if (-not (New-SshKey)) { return $false }
-        Show-PubKeyAndWait
+        if (-not (Show-PubKeyAndWait)) { Write-Host 'Отменено.'; return $false }
         if (Test-SshConnection $script:Config.user $script:Config.server $script:Config.ssh_port $script:KeyPath) {
             Write-Host 'Соединение по ключу подтверждено. Продолжаем...'
         } else {
@@ -223,7 +328,8 @@ function Ensure-Connection {
             return $true
         }
         Write-Host 'Ключ не принят сервером — показываю его, чтобы вы его добавили.'
-        Show-PubKeyAndWait
+        Write-Host ('Если сервер менял свой ключ — удалите файл {0} и повторите установку.' -f $script:KnownHosts)
+        if (-not (Show-PubKeyAndWait)) { Write-Host 'Отменено.'; return $false }
     }
 }
 
@@ -235,19 +341,22 @@ function Get-TunnelLoopCommand {
         $rp, $lp = $p.Split(':')
         $forward += '-NR {0}:localhost:{1} ' -f $rp, $lp
     }
+    $exe    = Get-SshExe
+    $hk     = Get-HostKeyCheckingOption
     $key    = $script:KeyPath.Replace('"', '""')
     $log    = $script:LogPath.Replace("'", "''")
+    $kh     = $script:KnownHosts.Replace('"', '""')
     $target = '{0}@{1}' -f $script:Config.user, $script:Config.server
     $port   = $script:Config.ssh_port
-    $kh     = $script:KnownHosts
 
     $lines = @(
         '$ErrorActionPreference = ''SilentlyContinue'''
         'while ($true) {'
         "    `$ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"
+        "    `$li = Get-Item -LiteralPath '$log' -ErrorAction SilentlyContinue"
+        "    if (`$li -and `$li.Length -gt 1048576) { Move-Item -LiteralPath '$log' -Destination '$log.old' -Force -ErrorAction SilentlyContinue }"
         "    Add-Content -LiteralPath '$log' -Value `"`$ts | Проброс [$($script:Config.ports)] -> $target (ssh-порт $port) ...`" -Encoding UTF8"
-        '    taskkill /f /im ssh.exe 2>$null'
-        "    ssh -N -i `"$key`" -p $port -o ServerAliveInterval=15 -o ServerAliveCountMax=6 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=no -o `"UserKnownHostsFile=$kh`" $($forward.Trim()) $target"
+        "    & `"$exe`" -N -i `"$key`" -p $port -o ServerAliveInterval=15 -o ServerAliveCountMax=6 -o ExitOnForwardFailure=yes -o `"StrictHostKeyChecking=$hk`" -o `"UserKnownHostsFile=$kh`" $($forward.Trim()) $target"
         "    `$ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'"
         "    Add-Content -LiteralPath '$log' -Value `"`$ts | Соединение потеряно или порт занят — повтор через 15 сек.`" -Encoding UTF8"
         '    Start-Sleep -Seconds 15'
@@ -256,10 +365,29 @@ function Get-TunnelLoopCommand {
     return ($lines -join "`n")
 }
 
+# завершает ТОЛЬКО ssh-процессы этого туннеля (по known_hosts и флагу -NR),
+# не трогая чужие ssh-сессии
+function Stop-OwnSshProcesses {
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name = 'ssh.exe'" -ErrorAction SilentlyContinue)) {
+        $cl = $p.CommandLine
+        if ($cl -and
+            $cl.IndexOf('ssh_tunnelkeeper_known_hosts', [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+            $cl.IndexOf('-NR', [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# включает (после Disable) и запускает задачу туннеля
+function Start-TunnelTask {
+    Enable-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue | Out-Null
+    Start-ScheduledTask -TaskName $script:TaskName -ErrorAction Stop
+}
+
 # --- установка задачи в планировщике Windows ---
 function Register-SshTask {
     Stop-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
-    Stop-Process -Name ssh -Force -ErrorAction SilentlyContinue
+    Stop-OwnSshProcesses
 
     $loop = Get-TunnelLoopCommand
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($loop))
@@ -335,7 +463,7 @@ function Register-SshTask {
 
 function Unregister-SshTask {
     Stop-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
-    Stop-Process -Name ssh -Force -ErrorAction SilentlyContinue
+    Stop-OwnSshProcesses
     if (Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction SilentlyContinue
         Write-Host ('Задача "{0}" удалена из планировщика.' -f $script:TaskName)
@@ -345,7 +473,7 @@ function Unregister-SshTask {
 }
 
 function Remove-CreatedFiles([bool]$includeKey) {
-    $paths = @($script:ConfigPath)
+    $paths = @($script:ConfigPath, $script:LogPath, ($script:LogPath + '.old'))
     if ($script:SelfPath -and
         -not $script:SelfPath.Equals($script:LivePath, [StringComparison]::OrdinalIgnoreCase)) {
         $paths += $script:LivePath
@@ -369,7 +497,7 @@ function Invoke-Setup([hashtable]$defaults) {
     Write-Host '---------------- НАСТРОЙКА ТУННЕЛЯ ----------------'
     $script:Config = @{
         server   = Get-ServerValue $defaults['server']
-        user     = Get-PromptValue 'Пользователь SSH' $defaults['user']
+        user     = Get-UserValue   $defaults['user']
         ssh_port = Get-PortValue   'SSH-порт сервера'  $defaults['ssh_port']
     }
     if ([string]::IsNullOrWhiteSpace($script:Config.server) -or
@@ -378,7 +506,7 @@ function Invoke-Setup([hashtable]$defaults) {
         Pause
         return
     }
-    if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
+    if (-not (Test-Path -LiteralPath (Get-SshExe))) {
         Write-Host 'ssh не найден. Установите "Клиент OpenSSH": Параметры -> Приложения -> Необязательные компоненты.'
         Pause
         return
@@ -417,8 +545,8 @@ function Invoke-Setup([hashtable]$defaults) {
     Write-Host ('Задача "{0}" установлена.' -f $script:TaskName)
     $start = Read-Host 'Запустить туннель сейчас? (д/н)'
     if ($start -match '^(д|y)') {
-        Start-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
-        Write-Host 'Туннель запущен.'
+        try { Start-TunnelTask | Out-Null; Write-Host 'Туннель запущен.' }
+        catch { Write-Host ('Ошибка запуска: {0}' -f $_.Exception.Message) }
     } else {
         Write-Host 'Туннель запустится автоматически (по расписанию планировщика).'
     }
@@ -430,8 +558,8 @@ function Invoke-Uninstall {
     Write-Host ''
     Write-Host '============== УДАЛЕНИЕ =============='
     Write-Host '  1 - Только задача в планировщике (ключ и файлы останутся)'
-    Write-Host '  2 - Задача + настройки и копия скрипта (ssh-ключ останется)'
-    Write-Host '  3 - Полностью: задача + настройки + ssh-ключ'
+    Write-Host '  2 - Задача + настройки, лог и копия скрипта (ssh-ключ останется)'
+    Write-Host '  3 - Полностью: задача + настройки + лог + ssh-ключ'
     Write-Host '  0 - Отмена'
     $ans = Read-Host 'Ваш выбор (1/2/3/0)'
     switch ($ans) {
@@ -493,7 +621,7 @@ function Show-Status {
         $restart = Read-Host 'Туннель сейчас не работает. Перезапустить? (д/н)'
         if ($restart -match '^(д|y)') {
             try {
-                Start-ScheduledTask -TaskName $script:TaskName -ErrorAction Stop
+                Start-TunnelTask | Out-Null
                 Write-Host 'Туннель запущен.'
             } catch {
                 Write-Host ('Ошибка запуска: {0}' -f $_.Exception.Message)
@@ -507,10 +635,14 @@ function Show-Status {
 }
 
 # --- меню: Остановить туннель ---
+# важно: Disable, иначе «сторож» (повтор триггера каждую минуту) снова
+# запустит задачу максимум через минуту
 function Stop-Tunnel {
+    Disable-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
     Stop-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
-    Stop-Process -Name ssh -Force -ErrorAction SilentlyContinue
-    Write-Host 'Туннель остановлен (задача остановлена, ssh-процессы завершены).'
+    Stop-OwnSshProcesses
+    Write-Host 'Туннель остановлен: задача остановлена и отключена, ssh-процессы туннеля завершены.'
+    Write-Host 'Включить снова: пункт 3 «Статус» -> перезапуск, или пункт 1 «Установить».'
     Pause
 }
 
@@ -595,7 +727,7 @@ function Apply-CfgAndTask([hashtable]$cfg) {
         return
     }
     try {
-        Start-ScheduledTask -TaskName $script:TaskName -ErrorAction Stop
+        Start-TunnelTask | Out-Null
         Write-Host 'Настройки сохранены, туннель перезапущен.'
     } catch {
         Write-Host 'Настройки сохранены. Туннель запустится сам по расписанию.'
@@ -642,7 +774,7 @@ function Invoke-Change {
             }
             '4' {
                 $cfg['server']   = Get-ServerValue $cfg['server']
-                $cfg['user']     = Get-PromptValue 'Новый пользователь SSH' $cfg['user']
+                $cfg['user']     = Get-UserValue   $cfg['user']
                 $cfg['ssh_port'] = Get-PortValue   'Новый SSH-порт сервера'  $cfg['ssh_port']
                 if ([string]::IsNullOrWhiteSpace($cfg['server'])) {
                     Write-Host 'Сервер должен быть заполнен.'
@@ -786,6 +918,7 @@ function Stop-AllSshTunnels {
                 elseif ($idx -ge 1 -and $idx -le $suspectTasks.Count) { $targets = @($suspectTasks[$idx - 1]) }
                 foreach ($t in $targets) {
                     try {
+                        Stop-ScheduledTask -TaskName $t.TaskName -TaskPath $t.Path -ErrorAction SilentlyContinue
                         Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.Path -Confirm:$false -ErrorAction Stop
                         Write-Host "Удалена задача: $($t.Path)$($t.TaskName)"
                         $deleted++
