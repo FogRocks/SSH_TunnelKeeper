@@ -711,7 +711,9 @@ function Invoke-Setup([hashtable]$defaults) {
     } else {
         Write-Msg 'Туннель запустится автоматически (по расписанию планировщика).' 'dim'
     }
-    Pause
+    Write-Host ''
+    $openHelp = Read-Prompt 'Настроить firewall/sshd на сервере? Открыть «Помощь» (д/н)'
+    if ($openHelp -match '^(д|y)') { Show-Help } else { Pause }
 }
 
 # --- меню: Удалить ---
@@ -1116,6 +1118,187 @@ function Stop-AllSshTunnels {
     Pause
 }
 
+# --- Помощь: настройка сервера (firewall / sshd) ---
+
+# известные "чувствительные" локальные порты: их публикация наружу опасна
+$script:SensitivePorts = @{
+    '3389' = 'RDP'; '445' = 'SMB'; '139' = 'NetBIOS'; '135' = 'RPC'
+    '21' = 'FTP'; '23' = 'Telnet'; '1433' = 'MSSQL'; '3306' = 'MySQL'
+    '5432' = 'PostgreSQL'; '5900' = 'VNC'; '5985' = 'WinRM'
+}
+
+# возвращает "23389 (RDP)" если локальный порт чувствительный, иначе "23389"
+function Format-RemotePort([string]$RemotePort, [string]$LocalPort) {
+    $name = $script:SensitivePorts[$LocalPort]
+    if ($name) { return ('{0} ({1})' -f $RemotePort, $name) }
+    return $RemotePort
+}
+
+# определяет публичный IP клиента через ipify; при неудаче возвращает $null
+function Get-PublicIp {
+    try {
+        $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 'https://api.ipify.org'
+        $ip = ($r.Content).Trim()
+        if ($ip -match '^[0-9A-Fa-f:.]{3,45}$') { return $ip }
+    } catch { }
+    return $null
+}
+
+# спрашивает у пользователя IP-адрес для разрешения в firewall
+function Get-AllowedIp {
+    Write-Host ''
+    Write-Msg 'IP, которому разрешён доступ к опубликованным портам:' 'dim'
+    Write-MenuItem '1' 'Определить автоматически (через api.ipify.org)'
+    Write-MenuItem '2' 'Ввести вручную'
+    Write-MenuItem '3' 'Оставить плейсхолдер <ваш_IP>'
+    $ans = Read-Prompt 'Ваш выбор (1/2/3)'
+    switch ($ans) {
+        '1' {
+            Write-Host 'Определяю публичный IP...'
+            $ip = Get-PublicIp
+            if ($ip) {
+                Write-Msg ('Публичный IP: {0}' -f $ip) 'ok'
+                Write-Msg 'Если вы работаете через VPN — укажите адрес, с которого реально подключаетесь (вариант 2).' 'warn'
+                return $ip
+            }
+            Write-Tag 'warn' 'Не удалось определить IP (нет сети или сервис недоступен) — введите вручную.'
+            $manual = Read-Prompt 'Разрешённый IP (Enter — плейсхолдер)'
+            if ([string]::IsNullOrWhiteSpace($manual)) { return '<ваш_IP>' }
+            return $manual.Trim()
+        }
+        '2' {
+            $manual = Read-Prompt 'Разрешённый IP (можно несколько через запятую)'
+            if ([string]::IsNullOrWhiteSpace($manual)) { return '<ваш_IP>' }
+            return $manual.Trim()
+        }
+        default { return '<ваш_IP>' }
+    }
+}
+
+# печатает команды firewall/sshd для одного удалённого порта
+function Write-PortSetup([string]$RemotePort, [string]$Label, [string]$Ip, [string]$Kind) {
+    if ($Kind -eq 'ufw') {
+        Write-Host ('  # ufw ({0})' -f $Label)
+        Write-Host ('  sudo ufw allow from {0} to any port {1} proto tcp' -f $Ip, $RemotePort)
+        Write-Host ('  sudo ufw deny {0}/tcp' -f $RemotePort)
+    } elseif ($Kind -eq 'iptables') {
+        Write-Host ('  # iptables ({0})' -f $Label)
+        Write-Host ('  sudo iptables -A INPUT -p tcp --dport {0} -s {1} -j ACCEPT' -f $RemotePort, $Ip)
+        Write-Host ('  sudo iptables -A INPUT -p tcp --dport {0} -j DROP' -f $RemotePort)
+        Write-Host '  sudo netfilter-persistent save'
+    } elseif ($Kind -eq 'windows') {
+        Write-Host ('  # Windows Server ({0})' -f $Label)
+        Write-Host ('  New-NetFirewallRule -DisplayName "Tunnel {0}" -Direction Inbound -Protocol TCP -LocalPort {0} -RemoteAddress {1} -Action Allow' -f $RemotePort, $Ip)
+    }
+}
+
+# показывает готовые команды настройки сервера (firewall и/или sshd)
+function Show-ServerSetup([string]$Mode, [string]$RemotePorts, [string]$LocalPorts) {
+    $pairs = @(ConvertTo-PortPairs $RemotePorts)
+    if ($pairs.Count -eq 0) {
+        Write-Tag 'warn' 'Пробросы не заданы — показываю плейсхолдер <PORT>.'
+        $pairs = @('')
+    }
+    $withFirewall = ($Mode -ne 'sshd')
+    $withSshd     = ($Mode -ne 'ufw' -and $Mode -ne 'iptables' -and $Mode -ne 'windows')
+
+    if ($withFirewall) {
+        $kind = $Mode
+        if ($kind -notin @('ufw','iptables','windows')) {
+            Write-Host ''
+            Write-Msg 'Система на сервере:' 'dim'
+            Write-MenuItem '1' 'ufw (Ubuntu/Debian)'
+            Write-MenuItem '2' 'iptables (прочие Linux)'
+            Write-MenuItem '3' 'Windows Server (редко)'
+            $k = Read-Prompt 'Ваш выбор (1/2/3)'
+            switch ($k) {
+                '1' { $kind = 'ufw' }
+                '2' { $kind = 'iptables' }
+                '3' { $kind = 'windows' }
+                default { $kind = 'ufw' }
+            }
+        }
+        $ip = Get-AllowedIp
+
+        Write-Host ''
+        Write-Host ("$(C 'title')FIREWALL НА СЕРВЕРЕ (выполнить на сервере)$script:Reset")
+        foreach ($p in $pairs) {
+            if ($p) {
+                $rp, $lp = $p.Split(':')
+                $label = Format-RemotePort $rp $lp
+                Write-Host ''
+                Write-Host ("# --- Порт {0} ---" -f $label)
+                Write-PortSetup $rp $label $ip $kind
+            } else {
+                Write-Host ''
+                Write-Host "# --- Порт <PORT> ---"
+                Write-PortSetup '<PORT>' '<PORT>' $ip $kind
+            }
+        }
+        Write-Host ''
+        Write-Msg ('Замените {0} на реальный адрес. По умолчанию остальные источники должны быть запрещены.' -f $ip) 'dim'
+    }
+
+    if ($withSshd) {
+        Write-Host ''
+        Write-Host ("$(C 'title')SSHD НА СЕРВЕРЕ (файл /etc/ssh/sshd_config)$script:Reset")
+        Write-Host '# Публикация проброшенных портов на интерфейсах сервера:'
+        Write-Host 'GatewayPorts yes'
+        Write-Host '# затем перезапустить: sudo systemctl restart sshd'
+    }
+}
+
+# --- Помощь: меню ---
+function Show-Help {
+    $cfg = Read-Cfg
+    $remotePorts = $cfg['ports']
+    Write-Host ''
+    Write-Header 'ПОМОЩЬ: НАСТРОЙКА СЕРВЕРА'
+
+    if ($cfg['server']) {
+        $plist = @(ConvertTo-PortPairs $remotePorts)
+        if ($plist.Count -gt 0) {
+            $shown = @()
+            foreach ($p in $plist) { $rp, $lp = $p.Split(':'); $shown += (Format-RemotePort $rp $lp) }
+            Write-Msg ('Сервер: {0}  |  Пробросы: {1}' -f $cfg['server'], ($shown -join ', '))
+        } else {
+            Write-Msg ('Сервер: {0}  |  Пробросы не заданы' -f $cfg['server'])
+        }
+        # мягкое предупреждение о чувствительных портах
+        $sens = @()
+        foreach ($p in $plist) {
+            $rp, $lp = $p.Split(':')
+            if ($script:SensitivePorts[$lp]) { $sens += (Format-RemotePort $rp $lp) }
+        }
+        if ($sens.Count -gt 0) {
+            Write-Host ''
+            Write-Msg ('Внимание: публикуются чувствительные службы ({0}).' -f ($sens -join ', ')) 'warn'
+            Write-Msg 'Их стоит ограничить firewall — разрешить только ваши IP и запретить остальное.' 'dim'
+        }
+    } else {
+        Write-Tag 'warn' 'Настройки ещё не заданы. Команды будут с плейсхолдером <PORT>.'
+    }
+
+    while ($true) {
+        Write-Host ''
+        Write-Msg 'Что показать?' 'dim'
+        Write-MenuItem '1' 'Firewall (ufw / iptables)'
+        Write-MenuItem '2' 'sshd (GatewayPorts)'
+        Write-MenuItem '3' 'Всё сразу'
+        Write-MenuItem '4' 'Windows Server (редко)'
+        Write-MenuItem '0' 'Назад'
+        $what = Read-Prompt 'Ваш выбор (1/2/3/4/0)'
+        switch ($what) {
+            '1' { Show-ServerSetup 'firewall' $remotePorts $cfg['ports']; Pause }
+            '2' { Show-ServerSetup 'sshd' $remotePorts $cfg['ports']; Pause }
+            '3' { Show-ServerSetup 'all' $remotePorts $cfg['ports']; Pause }
+            '4' { Show-ServerSetup 'windows' $remotePorts $cfg['ports']; Pause }
+            '0' { return }
+            default { Write-Tag 'err' 'Неверный пункт.' }
+        }
+    }
+}
+
 # --- Главное меню ---
 function Show-Menu {
     while ($true) {
@@ -1128,7 +1311,8 @@ function Show-Menu {
         Write-MenuItem '4' 'Изменить'
         Write-MenuItem '5' 'Остановить туннель'
         Write-MenuItem '6' 'Завершить все ssh-туннели'
-        Write-MenuItem '7' 'Выход'
+        Write-MenuItem '7' 'Помощь (настройка сервера)'
+        Write-MenuItem '8' 'Выход'
         Write-Host ''
         Write-Host ("$(C 'dim')$([string]([char]0x2500) * 55)$script:Reset")
         $choice = Read-Prompt 'Выберите пункт меню'
@@ -1140,7 +1324,8 @@ function Show-Menu {
             '4' { Clear-Host; try { Invoke-Change } catch { Show-Error $_ } }
             '5' { Clear-Host; try { Stop-Tunnel } catch { Show-Error $_ } }
             '6' { Clear-Host; try { Stop-AllSshTunnels } catch { Show-Error $_ } }
-            '7' { Write-Host ("$(C 'title')До свидания!$script:Reset"); exit }
+            '7' { Clear-Host; try { Show-Help } catch { Show-Error $_ } }
+            '8' { Write-Host ("$(C 'title')До свидания!$script:Reset"); exit }
             default { Write-Tag 'err' 'Неверный пункт меню, попробуйте ещё раз.'; Pause }
         }
     }
