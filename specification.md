@@ -1,6 +1,6 @@
 # SSH TunnelKeeper — техническое описание (specification)
 
-> Версия: 1.1 · Файл: `SSH_TunnelKeeper.bat`
+> Версия: 1.2 · Файл: `SSH_TunnelKeeper.bat`
 > Назначение: менеджер **обратных SSH-туннелей** (`-R` / RemoteForward) для Windows.
 
 ## Оглавление
@@ -114,12 +114,17 @@ UTF-8, находит маркер и исполняет код после не�
 | `Pause` | ожидание Enter |
 | `Get-PromptValue Label Default` | ввод строки с дефолтом и `Trim()`; пусто = дефолт |
 | `Get-PortValue Label Default` | порт 1–65535, цикл до корректного ввода |
-| `Get-ServerValue Default` | адрес сервера с валидацией символов |
+| `Get-ServerValue Default` | адрес сервера с валидацией символов (запрет ведущего `-`) |
 | `ConvertTo-PortPairs Raw` | `"A:B, C:D"` → `["A:B","C:D"]`; невалидный формат → **пустой массив** (не `$null`, §16) |
 | `Show-PortPairs` | вывод списка пробросов |
+| `Read-Prompt Prompt` | цветной prompt + `Read-Host` (единая точка ввода; подгоняет высоту окна) |
+| `ConvertFrom-Secure Sec` | `SecureString` → открытая строка (единая точка расшифровки паролей/фраз) |
+| `Expand-Selection Choices Items` | выбор номеров → элементы (`0` = все, с проверкой границ) |
 
-Валидация адреса: допустимы `[0-9A-Za-z.\-_]`, иначе предупреждение и повтор
-ввода (защита от `example,com`).
+Валидация адреса: `^[0-9A-Za-z.][0-9A-Za-z.\-_]*$` — первый символ не `-`
+(защита от argument injection `-oProxyCommand=...`), иначе предупреждение и
+повтор ввода (также защита от `example,com`). Та же проверка повторяется при
+чтении конфига (`Read-Cfg`) и в `Get-TunnelLoopCommand`.
 
 ### 5.2. Конфигурация
 
@@ -133,11 +138,11 @@ UTF-8, находит маркер и исполняет код после не�
 | Функция | Назначение |
 |---|---|
 | `Get-SshExe` / `Get-SshKeygenExe` | полный путь к `ssh.exe` / `ssh-keygen.exe` (System32\OpenSSH, Program Files, PATH) |
-| `Get-HostKeyCheckingOption` | офлайн-детект `accept-new` через `ssh -G` (OpenSSH ≥ 7.6); fallback `no` |
+| `Get-HostKeyCheckingOption` | детект `accept-new` через `ssh -G` с проверкой **реального** вывода эффективной конфигурации (OpenSSH ≥ 7.6); fallback **`yes`** (fail-closed — проверка ключа сервера не отключается) |
 | `New-SshKey` | `ssh-keygen -t ed25519`; фраза опциональна (по умолчанию без — для автозапуска до входа); комментарий нейтральный (`ssh-tunnelkeeper`) |
 | `Get-PubKeyString` | публичный ключ из `.pub` (настоящий комментарий), иначе `ssh-keygen -y` |
 | `Test-SshConnection` | фоновый вход: `BatchMode=yes`, `ConnectTimeout=8`, `StrictHostKeyChecking=<детект>`, свой `UserKnownHostsFile`; успех = код `0` |
-| `Show-PubKeyAndWait` | показать ключ; **Esc = отмена** (`$false`), иначе любая клавиша |
+| `Show-PubKeyBox` | показать ключ в рамке; параметр `-Cancelable`: **Esc = отмена** (`$false`), иначе любая клавиша |
 | `Ensure-Connection` | логика авторизации (§6) |
 
 ### 5.4. Задача планировщика
@@ -275,9 +280,9 @@ while ($true) {
         -o ServerAliveInterval=15       # keepalive каждые 15 сек
         -o ServerAliveCountMax=6        # ~90 сек молчания -> разрыв
         -o ExitOnForwardFailure=yes     # не жить без пробросов
-        -o "StrictHostKeyChecking=<accept-new|no>"
+        -o "StrictHostKeyChecking=<accept-new|yes>"
         -o "UserKnownHostsFile=<kh>"    # выделенный known_hosts в .ssh
-        -NR <удалённый>:localhost:<локальный> ... <user>@<server>
+        -NR <удалённый>:localhost:<локальный> ... -- <user>@<server>
     лог: "Соединение потеряно или порт занят — повтор через 15 сек."
     Start-Sleep -Seconds 15
 }
@@ -381,10 +386,12 @@ ports=23389:3389,2445:445
 - Приватный ключ не показывается; наружу только публичный.
 - Комментарий ключа **нейтральный** (`ssh-tunnelkeeper`) — без имени ПК/пользователя.
 - known_hosts туннеля — в `.ssh\ssh_tunnelkeeper_known_hosts` (не `%TEMP%`,
-  не глобальный): очистка temp не сбрасывает проверку.
+  не глобальный): очистка temp не сбрасывает проверку. Примечание: файл
+  расположен в user-writable каталоге — локальный пользователь может его
+  изменить; для повышения стойкости храните каталог с ACL только для админа.
 - `accept-new`: новый ключ сервера принимается один раз, при смене — отклоняется
-  (защита от MITM). Без поддержки — fallback `no` (иначе на старых ssh первое
-  подключение невозможно: BatchMode, нет TTY).
+  (защита от MITM). При сбое детекта опции — fallback **`yes`** (fail-closed):
+  известные хосты проверяются, смена ключа отклоняется; проверка НЕ отключается.
 - Ключ с опциональной фразой: по умолчанию без (для автозапуска до входа), с
   фразой безопаснее, но нужен ssh-agent/Pageant.
 - `ssh.exe`/`ssh-keygen.exe` — по абсолютным путям (защита от подмены PATH).
@@ -396,11 +403,45 @@ ports=23389:3389,2445:445
 ## 15. Требования
 
 - Windows 10/11; клиент OpenSSH (путь разрешается автоматически);
-- OpenSSH ≥ 7.6 (для `accept-new`); на старых — fallback `no`;
+- OpenSSH ≥ 7.6 (для `accept-new`); на старых — fallback `yes` (fail-closed);
 - PowerShell 5.1+ (модуль `ScheduledTasks`);
 - права администратора (для задачи);
 - на сервере `sshd_config`: `AllowTcpForwarding yes`, `GatewayPorts yes`,
   `ClientAliveInterval 15`, `ClientAliveCountMax 6`.
+
+---
+
+## 15.1. Защита опубликованных портов (периметр)
+
+Скрипт просит у sshd `GatewayPorts yes`, поэтому проброшенные порты
+(например `23389`) слушают на всех интерфейсах сервера и видны всему
+интернету. Сам скрипт доступ к ним НЕ ограничивает — это настройка сервера.
+
+Рекомендация: разрешить вход только с доверенных IP, остальное запретить.
+
+Linux-сервер (пример):
+
+    # ufw (Ubuntu/Debian)
+    sudo ufw allow from 203.0.113.7 to any port 23389 proto tcp
+    sudo ufw deny 23389/tcp
+
+    # iptables
+    sudo iptables -A INPUT -p tcp --dport 23389 -s 203.0.113.7 -j ACCEPT
+    sudo iptables -A INPUT -p tcp --dport 23389 -j DROP
+    # сохранить после перезагрузки: netfilter-persistent save
+
+Windows-сервер (пример):
+
+    New-NetFirewallRule -DisplayName "Reverse tunnel 23389" -Direction Inbound `
+      -Protocol TCP -LocalPort 23389 -RemoteAddress 203.0.113.7 -Action Allow
+
+Дополнительно (на сервере):
+- `GatewayPorts clientspecified` — публиковать порты только на выбранном
+  адресе, а не на всех интерфейсах;
+- в `sshd_config` ограничить пользователей (`AllowUsers`) и адрес прослушки.
+
+Важно: это защита сервера, а не клиента. Firewall на ПК клиента на эти
+порты не влияет — слушает сервер.
 
 ---
 
@@ -417,30 +458,36 @@ ports=23389:3389,2445:445
 | 7 | `taskkill /f /im ssh.exe` убивал чужие сессии | `Stop-OwnSshProcesses` по признаку `ssh_tunnelkeeper_known_hosts` + `-NR` |
 | 8 | `Stop-Process -Name ssh` убивал чужие ssh | Заменено на `Stop-OwnSshProcesses` |
 | 9 | known_hosts во `%TEMP%` сбрасывал TOFU | Перенесён в `.ssh\ssh_tunnelkeeper_known_hosts`; temp-копия удаляется |
-| 10 | `StrictHostKeyChecking=no` принимал любой ключ | Детект `accept-new` через `ssh -G`; fallback `no` |
+| 10 | `StrictHostKeyChecking=no` принимал любой ключ | Детект `accept-new` через `ssh -G` (с проверкой вывода); fallback **`yes`** (fail-closed) |
 | 11 | Комментарий ключа содержал `USERNAME@COMPUTERNAME` | Нейтральный `ssh-tunnelkeeper` |
 | 12 | `Get-PortValue`: `[int]` переполнялся | Валидация через `[long]` |
-| 13 | Показ ключа нельзя было отменить | Esc в `Show-PubKeyAndWait` → прерывает установку |
+| 13 | Показ ключа нельзя было отменить | Esc в `Show-PubKeyBox -Cancelable` → прерывает установку |
 | 14 | Лог рос без ограничений | Ротация > 1 МБ → `.old` |
 | 15 | Комментарий ключа реконструировался; ssh искался в PATH | Приоритет `.pub`; пути разрешаются и запекаются |
 | 16 | Ключ всегда без фразы — кража профиля = доступ | Предлагается задать фразу |
 | 17 | Логин SSH не валидировался | Белый список `^[0-9A-Za-z._\\][0-9A-Za-z._\\-]*$` |
 | 18 | `Get-SafeComment` раскрывал личные данные | Удалена; только константа `ssh-tunnelkeeper` |
 | 19 | `Remove-CreatedFiles` не удалял лог | Лог добавлен в удаление (варианты 2/3) |
+| 20 | Значения из user-writable config исполнялись от админа без повторной валидации (command injection в задаче) | `Read-Cfg` валидирует `server`/`user`/`ssh_port`/`ports`; `Get-TunnelLoopCommand` перепроверяет и `throw` при невалидности |
+| 21 | Ведущий `-` в адресе сервера позволял argument injection в ssh | `Get-ServerValue`/`Read-Cfg` запрещают ведущий `-`; в ssh-команды добавлен разделитель `--` перед `user@host` |
+| 22 | Открытая строка пароля Windows могла утечь в текст исключения | `catch` не выводит `Exception.Message`; `$plain`/`$passPhrase` снимаются + `[GC]::Collect()` (best-effort) |
+| 23 | «Завершить все ssh» без подтверждения и с широкой эвристикой задач | Показ списка + подтверждение перед kill всех ssh; строгий regex для задач (снижены ложные срабатывания) |
+| 24 | Экранирование встроенных путей в генерируемом скрипте неполное | Пути/цель экранируются от `"`; значения перепроверяются перед запеканием |
+| 25 | Дублирование кода: расшифровка `SecureString`, разбор выбора номеров, цветной ввод | Вынесены `ConvertFrom-Secure`, `Expand-Selection`, `Read-Prompt` (поведение не менялось) |
 
 ---
 
 ## 17. Тестирование
 
 **Харнес** (моделирование вместо реальных команд): v1.0 — **22/22 PASS**,
-v1.1 — ~70 проверок PASS. Покрытие:
+v1.1 — ~70 проверок PASS, v1.2 — рефакторинг + проверка хелперов PASS. Покрытие:
 
 - валидация портов (`[long]`, диапазон), сервера, пользователя;
 - `Get-TunnelLoopCommand`: запечённые пути, `accept-new`, нет `taskkill`,
   ротация лога, парсинг сгенерированного скрипта;
 - `Stop-Tunnel`/`Start-TunnelTask`: порядок Disable/Stop/Enable/Start;
 - `Stop-OwnSshProcesses`: признаки командной строки;
-- Esc в `Show-PubKeyAndWait`/`Ensure-Connection`;
+- Esc в `Show-PubKeyBox -Cancelable` / `Ensure-Connection`;
 - цикл пароля (неверные → режим при входе; пустой → дефолт);
 - `ConvertTo-PortPairs`: валидная/недопустимая/пустая строка.
 
